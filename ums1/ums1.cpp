@@ -10,6 +10,7 @@ char *status200HelloWorld = "HTTP/1.1 200 Ok\r\nContent-Length: 12\r\nConnection
 #include <km\Fltkernel.h>
 #else
 
+/*  START OF LIBUV SOURCE MATERIAL (SEE LIBUV-LICENSE)  */
 namespace WinInternal {
 
 typedef struct _FILE_BASIC_INFORMATION {
@@ -323,6 +324,8 @@ __forceinline void fs_stat() {
 	fs__stat_handle(handle);
 	CloseHandle(handle);
 }
+
+/*  END OF LIBUV SOURCE MATERIAL (SEE LIBUV-LICENSE)  */
 
 __declspec(align(64)) __int64 volatile dequeuedRequestCount{0};
 __declspec(align(64)) unsigned __int64 volatile firstRequestStarted{0};
