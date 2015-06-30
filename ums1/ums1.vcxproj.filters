@@ -13,21 +13,96 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="PCH">
+      <UniqueIdentifier>{e71b628a-36ce-49d8-aa6e-f11ebb12eed5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\UserModeScheduling">
+      <UniqueIdentifier>{1c95556f-8ab6-4e0d-9ab1-abe5e43094b9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NewThreadPoolApi">
+      <UniqueIdentifier>{47833c2d-7619-4eab-9be3-a4ff8216769a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\OldThreadPoolApi">
+      <UniqueIdentifier>{ec6ebaff-33dc-4ddc-8979-d75c89ab5c94}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="stdafx.h">
+    <ClInclude Include="DirectThreadPool.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="stdafx.h">
+      <Filter>PCH</Filter>
     </ClInclude>
     <ClInclude Include="targetver.h">
-      <Filter>Header Files</Filter>
+      <Filter>PCH</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\DebugStream.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\UserModeScheduling.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\Scheduler.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\DefaultHeapSlab.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\ThreadAttributeList.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\WorkerThread.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\WorkerThreadVector.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\SchedulerThread.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\CompletionList.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\StartupInfo.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\CritialSectionWrapper.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\ThreadContextQueue.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\Processor.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="UserModeScheduling\AtomicSinglyLinkedList.h">
+      <Filter>Header Files\UserModeScheduling</Filter>
+    </ClInclude>
+    <ClInclude Include="NewThreadPoolApi\NewThreadPoolApi.h">
+      <Filter>Header Files\NewThreadPoolApi</Filter>
+    </ClInclude>
+    <ClInclude Include="OldThreadPoolApi\OldThreadPoolApi.h">
+      <Filter>Header Files\OldThreadPoolApi</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="stdafx.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="ums1.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="test_new_thread_pool.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="test_old_thread_pool.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="test_user_mode_scheduling.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="test_direct_thread_pool.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="stdafx.cpp">
+      <Filter>PCH</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

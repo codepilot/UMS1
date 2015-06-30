@@ -1,592 +1,557 @@
 #include "stdafx.h"
 
-#define USE_USER_MODE_SCHEDULING
-
-#ifndef USE_USER_MODE_SCHEDULING
-#define USE_NEW_THREAD_POOL
-#endif
-
-#define numSchedulers 16
-#define numThreadsPerScheduler 16
-#define numSockets 256
-
-
-
-#ifdef USE_USER_MODE_SCHEDULING
-HANDLE listEvents[numSchedulers];
-PUMS_COMPLETION_LIST completionList[numSchedulers];
-UMS_SCHEDULER_STARTUP_INFO SchedulerStartupInfo[numSchedulers];
-DWORD WINAPI UmsWorkerThreadProc(LPVOID lpParameter);
-VOID NTAPI UmsSchedulerProc(UMS_SCHEDULER_REASON Reason, ULONG_PTR ActivationPayload, PVOID SchedulerParam);
-HANDLE completionPort=NULL;
-DWORD dwTlsID;
-#endif
-
-#ifdef USE_NEW_THREAD_POOL
-PTP_POOL pMainPool;
-PTP_CLEANUP_GROUP pCleanup;
-TP_CALLBACK_ENVIRON tEnvrion;
-PTP_IO pListen;
-#endif
-
 LPFN_DISCONNECTEX DisconnectEx=0;
 SOCKET sListen;
 
-#ifdef _DEBUG
-#define ods(txt) {OutputDebugString(TEXT(txt));}
-#else
-#define ods(txt)
-#endif
+char *status200HelloWorld = "HTTP/1.1 200 Ok\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHello World!";
 
-//#define ods(txt)
-
-char status200HelloWorld[]="HTTP/1.1 200 Ok\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHello World!";
-#ifdef USE_USER_MODE_SCHEDULING
-
-typedef enum _COMPLETION_KEY {
-	CKACCEPT = 0,
-	CKRECV,
-	CKSEND
-} COMPLETION_KEY, *PCOMPLETION_KEY;
-
-typedef enum _OVERLAPPED_ACCEPT_STATE {
-	OAS_RECV = 0,
-	OAS_SEND,
-	OAS_CLOSE
-} OVERLAPPED_ACCEPT_STATE, *POVERLAPPED_ACCEPT_STATE;
-
-typedef struct _OVERLAPPED_ACCEPT {
-	OVERLAPPED overlapped;
-	SOCKET s;
-	OVERLAPPED_ACCEPT_STATE oas;
-	DWORD bufSize;
-    LPVOID acceptBuf;
-} OVERLAPPED_ACCEPT, *LPOVERLAPPED_ACCEPT;
-
-
-#define makeCompletionPort() CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, NULL, 0)
-#define addCompletionHandle(cp, fh, key) CreateIoCompletionPort(fh, cp, key, 0)
-DWORD WINAPI UmsWorkerThreadProc(LPVOID lpParameter) {
-	ods("*****UmsWorkerThreadProcStart\n");
-	for(;;){
-		ods("waiting start\n");
-		BOOL success;
-		const int maxEntries=1;
-		OVERLAPPED_ENTRY oe[maxEntries];
-		ULONG numRemoved=0;
-		success=GetQueuedCompletionStatusEx(completionPort, oe, maxEntries, &numRemoved, INFINITE, false);
-		if(!success){
-			DebugBreak();
-		}
-		for(ULONG i=0; i<numRemoved; i++){
-			if(CKACCEPT==oe[i].lpCompletionKey){
-				ods("CKACCEPT\n");
-				LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)oe[i].lpOverlapped;
-				DWORD numRead=0;
-				SecureZeroMemory(oe[i].lpOverlapped, sizeof(OVERLAPPED));
-				ola->oas=OAS_RECV;
-				success=ReadFile((HANDLE)ola->s, ola->acceptBuf, ola->bufSize, &numRead, oe[i].lpOverlapped);
-				if(!success && GetLastError()!=ERROR_IO_PENDING){
-					int wsaError=WSAGetLastError();
-					DebugBreak();
-				}
-			}else if(CKRECV==oe[i].lpCompletionKey){
-				LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)oe[i].lpOverlapped;
-				if(OAS_RECV==ola->oas){
-					ods("OAS_RECV\n");
-					DWORD numWritten=0;
-					SecureZeroMemory(oe[i].lpOverlapped, sizeof(OVERLAPPED));
-					DWORD sizeofSend=sizeof(status200HelloWorld)-1;
-					CopyMemory(ola->acceptBuf, status200HelloWorld, sizeofSend);
-					ola->oas=OAS_SEND;
-					success=WriteFile((HANDLE)ola->s, ola->acceptBuf, sizeofSend, &numWritten, oe[i].lpOverlapped);
-					if(!success && GetLastError()!=ERROR_IO_PENDING){
-						int wsaError=WSAGetLastError();
-						DebugBreak();
-					}
-				}else if(OAS_SEND==ola->oas){
-					ods("OAS_SEND\n");
-					SecureZeroMemory(oe[i].lpOverlapped, sizeof(OVERLAPPED));
-					ola->oas=OAS_CLOSE;
-					success=DisconnectEx(ola->s, oe[i].lpOverlapped, TF_REUSE_SOCKET, 0);
-					if(!success && GetLastError()!=ERROR_IO_PENDING){
-						int wsaError=WSAGetLastError();
-						DebugBreak();
-					}
-				}else if(OAS_CLOSE==ola->oas){
-					ods("OAS_CLOSE\n");
-					DWORD acceptBufSize=max(0, ola->bufSize-sizeof(sockaddr_in)-16-sizeof(sockaddr_in)-16);
-					acceptBufSize=0;
-					success=AcceptEx(sListen, ola->s, ola->acceptBuf, acceptBufSize, sizeof(sockaddr_in)+16, sizeof(sockaddr_in)+16, 0, &ola->overlapped);
-					if(!success && WSAGetLastError()!=ERROR_IO_PENDING){
-						DebugBreak();
-					}
-				}else{
-					DebugBreak();
-				}
-			}else{
-				DebugBreak();
-			}
-		}
-		ods("waiting end\n");
-	}
-	ods("*****UmsWorkerThreadProcEnd\n");
-	return 0;
-}
-
-typedef struct _THREAD_LIST_ITEM {
-	_THREAD_LIST_ITEM *next;
-	PUMS_CONTEXT thread;
-} THREAD_LIST_ITEM, *PTHREAD_LIST_ITEM;
-
-PTHREAD_LIST_ITEM threadList[numSchedulers]={0};
-UINT numThreadsAlive[numSchedulers]={0};
-UINT numThreadsInList[numSchedulers]={0};
-
-void addThreadToList(DWORD n, PUMS_CONTEXT thread){
-	PTHREAD_LIST_ITEM threadListHead=(PTHREAD_LIST_ITEM)HeapAlloc(GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS|HEAP_ZERO_MEMORY, sizeof(THREAD_LIST_ITEM));
-	threadListHead->next=threadList[n];
-	threadListHead->thread=thread;
-	threadList[n]=threadListHead;
-	numThreadsInList[n]++;
-}
-
-PUMS_CONTEXT removeThreadFromList(DWORD n){
-	PTHREAD_LIST_ITEM threadListHead=threadList[n];
-	PUMS_CONTEXT nThread=threadListHead->thread;
-	threadList[n]=threadListHead->next;
-	HeapFree(GetProcessHeap(), 0, threadListHead);
-	numThreadsInList[n]--;
-	if(!threadList[n]){
-		ods("!threadList\n");
-	}
-	return nThread;
-}
-
-VOID NTAPI UmsSchedulerProc(UMS_SCHEDULER_REASON Reason, ULONG_PTR ActivationPayload, PVOID SchedulerParam){
-	DWORD id=(DWORD)TlsGetValue(dwTlsID);
-	//ods("UmsSchedulerProc\n"));
-	if(UmsSchedulerStartup==Reason){
-		ods("UmsSchedulerStartup\n");
-	}else if(UmsSchedulerThreadBlocked==Reason){
-		ods("UmsSchedulerThreadBlocked\n");
-		if(ActivationPayload&1){
-			ods("blocked by system call\n");
-		}else{
-			ods("blocked by trap(ex. hard page fault), interrupt(ex. apc)\n");
-		}
-	}else if(UmsSchedulerThreadYield==Reason){
-		ods("UmsSchedulerThreadYield\n");
-		addThreadToList(id, (PUMS_CONTEXT)ActivationPayload);
-		//	ActivationPayload=UMS Thread Context yielded
-		//	SchedulerParam=UmsThreadYield.param
-	}
-	BOOL success;
-	for(;;){
-		if(!numThreadsAlive[id]){
-			break;
-			return;
-		}
-		PUMS_CONTEXT UmsThreadList=0;
-		if(!numThreadsInList[id]){
-			DWORD waitSTS=WaitForMultipleObjects(numSchedulers, listEvents, false, INFINITE);
-			if(waitSTS==WAIT_FAILED){
-				DebugBreak();
-			}
-			DWORD n=waitSTS-WAIT_OBJECT_0;
-			ods("WaitingForDequeue\n");
-			success=DequeueUmsCompletionListItems(completionList[n], INFINITE, &UmsThreadList);
-			if(UmsThreadList){
-				//ods("DequeueUmsCompletionListItems Success\n"));
-				for(;;){
-					addThreadToList(id, UmsThreadList);
-
-					ods("GetNextUmsListItem\n");
-					UmsThreadList=GetNextUmsListItem(UmsThreadList);
-					if(!UmsThreadList){break;}
-				}
-			}else if(success){
-			}else{
-				ods("DequeueUmsCompletionListItems Fail\n");
-			}
-		}
-		if(threadList[id]){
-			while(threadList[id]){
-				PUMS_CONTEXT nThread=removeThreadFromList(id);
-				ULONG retLen=0;
-				BOOLEAN isSuspended=0, isTerminated=0;
-				QueryUmsThreadInformation(nThread, UmsThreadIsSuspended, &isSuspended, sizeof(BOOLEAN), &retLen);
-				if(isSuspended){
-					ods("isSuspended\n");
-				}
-				QueryUmsThreadInformation(nThread, UmsThreadIsTerminated, &isTerminated, sizeof(BOOLEAN), &retLen);
-				if(isTerminated){
-					ods("isTerminated\n");
-				}
-				if(isTerminated){
-					success=DeleteUmsThreadContext(nThread);
-					if(!success){
-						DebugBreak();
-					}
-					numThreadsAlive[id]--;
-					if(!numThreadsAlive[id]){
-						ods("!numThreadsAlive\n");
-					}
-				}else{
-					for(;;){
-						ods("ExecuteUmsThread\n");
-						success=ExecuteUmsThread(nThread);
-						if(!success){
-							ods("ExecuteUmsThread Fail\n");
-						}else{
-							ods("ExecuteUmsThread Success\n");
-						}
-					}
-				}
-			}
-		}else{
-			ods("threadList==NULL\n");
-		}
-	}
-	ods("UmsSchedulerProc returning\n");
-	return;
-}
-
-void addThread(UINT n, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter){
-	BOOL success;
-	SIZE_T lpSize=0;
-	PUMS_CONTEXT tContext;
-	success=CreateUmsThreadContext(&tContext);
-	if(success){SetLastError(0);}
-	LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList=NULL;
-	success=InitializeProcThreadAttributeList(lpAttributeList, 1, 0, &lpSize);
-	lpAttributeList=(LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS|HEAP_ZERO_MEMORY, lpSize);
-	success=InitializeProcThreadAttributeList(lpAttributeList, 1, 0, &lpSize);
-	if(success){SetLastError(0);}
-	UMS_CREATE_THREAD_ATTRIBUTES threadAttributes;
-	threadAttributes.UmsVersion=UMS_VERSION;
-	threadAttributes.UmsContext=tContext;
-	threadAttributes.UmsCompletionList=completionList[n];
-	success=UpdateProcThreadAttribute(lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_UMS_THREAD, &threadAttributes, sizeof(threadAttributes), NULL, NULL);
-	if(success){SetLastError(0);}
-
-
-	HANDLE rt1=CreateRemoteThreadEx(GetCurrentProcess(), NULL, 0, &UmsWorkerThreadProc, lpParameter, 0, lpAttributeList, NULL);
-
-	DeleteProcThreadAttributeList(lpAttributeList);
-	HeapFree(GetProcessHeap(), 0, lpAttributeList); lpAttributeList=NULL;
-
-	if(!rt1){
-		ods("CreateRemoteThreadEx Failure\n");
-		DebugBreak();
-		return;
-	}else{
-		//ods("CreateRemoteThreadEx Success\n"));
-		success=CloseHandle(rt1);
-		if(success){SetLastError(0);}
-	}
-}
-
-DWORD WINAPI SchedulerProc(LPVOID lpParameter){
-	BOOL success;
-	TlsSetValue(dwTlsID, lpParameter);
-	success=EnterUmsSchedulingMode(&SchedulerStartupInfo[(UINT)lpParameter]);
-	if(!success){
-		DebugBreak();
-	}else{
-		SetLastError(0);
-	}
-	success=DeleteUmsCompletionList(completionList[(UINT)lpParameter]);
-	if(!success){
-		DebugBreak();
-	}else{
-		SetLastError(0);
-	}
-	return 0;
-}
-
-void addAcceptSocket(SOCKET sListen) {
-	BOOL success;
-	SOCKET sAccept=WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if(INVALID_SOCKET==sAccept){
-		DebugBreak();
-	}
-	if(completionPort!=addCompletionHandle(completionPort, (HANDLE)sAccept, CKRECV)){
-		DebugBreak();
-	};
-	DWORD nBufSize=max(4096, (sizeof(sockaddr_in)+16)*2);
-	LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)HeapAlloc(GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS|HEAP_ZERO_MEMORY, sizeof(OVERLAPPED_ACCEPT)+nBufSize);
-	ola->acceptBuf=(UINT8*)ola+sizeof(OVERLAPPED_ACCEPT);
-	ola->s=sAccept;
-	ola->bufSize=nBufSize;
-	DWORD acceptBufSize=max(0, ola->bufSize-sizeof(sockaddr_in)-16-sizeof(sockaddr_in)-16);
-	acceptBufSize=0;
-	success=AcceptEx(sListen, ola->s, ola->acceptBuf, acceptBufSize, sizeof(sockaddr_in)+16, sizeof(sockaddr_in)+16, 0, &ola->overlapped);
-	if(!success && WSAGetLastError()!=ERROR_IO_PENDING){
-		DebugBreak();
-	}
-}
-
-#endif
-
-#ifdef USE_NEW_THREAD_POOL
-
-typedef enum _OVERLAPPED_ACCEPT_STATE {
-	OAS_RECV = 0,
-	OAS_SEND,
-	OAS_CLOSE
-} OVERLAPPED_ACCEPT_STATE, *POVERLAPPED_ACCEPT_STATE;
-
-typedef struct _OVERLAPPED_ACCEPT {
-	OVERLAPPED overlapped;
-	PTP_IO tp;
-	SOCKET s;
-	OVERLAPPED_ACCEPT_STATE oas;
-	DWORD bufSize;
-    LPVOID acceptBuf;
-} OVERLAPPED_ACCEPT, *LPOVERLAPPED_ACCEPT;
-
-VOID CALLBACK acceptingIoThreadProc(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PVOID Overlapped, ULONG IoResult, ULONG_PTR NumberOfBytesTransferred, PTP_IO Io) {
-	ods("acceptingIoThreadProc start\n");
-	BOOL success;
-	LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)Overlapped;
-	SecureZeroMemory(Overlapped, sizeof(OVERLAPPED));
-	ola->oas=OAS_RECV;
-	DWORD numRead=0;
-	StartThreadpoolIo(ola->tp);
-	success=ReadFile((HANDLE)ola->s, ola->acceptBuf, ola->bufSize, &numRead, &ola->overlapped);
-	if(!success && GetLastError()!=ERROR_IO_PENDING){
-		int wsaError=WSAGetLastError();
-		DebugBreak();
-	}
-	ods("acceptingIoThreadProc return\n");
-}
-
-VOID CALLBACK workerIoThreadProc(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PVOID Overlapped, ULONG IoResult, ULONG_PTR NumberOfBytesTransferred, PTP_IO Io) {
-	ods("workerIoThreadProc start\n");
-	BOOL success;
-	LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)Overlapped;
-	if(OAS_RECV==ola->oas){
-		ods("OAS_RECV\n");
-		DWORD numWritten=0;
-		SecureZeroMemory(Overlapped, sizeof(OVERLAPPED));
-		DWORD sizeofSend=sizeof(status200HelloWorld)-1;
-		CopyMemory(ola->acceptBuf, status200HelloWorld, sizeofSend);
-		ola->oas=OAS_SEND;
-		StartThreadpoolIo(Io);
-		success=WriteFile((HANDLE)ola->s, ola->acceptBuf, sizeofSend, &numWritten, &ola->overlapped);
-		if(!success && GetLastError()!=ERROR_IO_PENDING){
-			int wsaError=WSAGetLastError();
-			DebugBreak();
-		}
-	}else if(OAS_SEND==ola->oas){
-		ods("OAS_SEND\n");
-		SecureZeroMemory(Overlapped, sizeof(OVERLAPPED));
-		ola->oas=OAS_CLOSE;
-		StartThreadpoolIo(Io);
-		success=DisconnectEx(ola->s, &ola->overlapped, TF_REUSE_SOCKET, 0);
-		if(!success && GetLastError()!=ERROR_IO_PENDING){
-			int wsaError=WSAGetLastError();
-			DebugBreak();
-		}
-	}else if(OAS_CLOSE==ola->oas){
-		ods("OAS_CLOSE\n");
-		DWORD acceptBufSize=max(0, ola->bufSize-sizeof(sockaddr_in)-16-sizeof(sockaddr_in)-16);
-		acceptBufSize=0;
-		StartThreadpoolIo(pListen);
-		success=AcceptEx(sListen, ola->s, ola->acceptBuf, acceptBufSize, sizeof(sockaddr_in)+16, sizeof(sockaddr_in)+16, 0, &ola->overlapped);
-		if(!success && WSAGetLastError()!=ERROR_IO_PENDING){
-			DebugBreak();
-		}
-	}else{
-		DebugBreak();
-	}
-	ods("workerIoThreadProc return\n");
-}
-
-void addAcceptSocket(SOCKET sListen) {
-	BOOL success;
-	SOCKET sAccept=WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if(INVALID_SOCKET==sAccept){
-		DebugBreak();
-	}
-	DWORD nBufSize=max(4096, (sizeof(sockaddr_in)+16)*2);
-	LPOVERLAPPED_ACCEPT ola=(LPOVERLAPPED_ACCEPT)HeapAlloc(GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS|HEAP_ZERO_MEMORY, sizeof(OVERLAPPED_ACCEPT)+nBufSize);
-	ola->tp=CreateThreadpoolIo((HANDLE)sAccept, workerIoThreadProc, 0, &tEnvrion);
-	ola->acceptBuf=(UINT8*)ola+sizeof(OVERLAPPED_ACCEPT);
-	ola->s=sAccept;
-	ola->bufSize=nBufSize;
-	DWORD acceptBufSize=max(0, ola->bufSize-sizeof(sockaddr_in)-16-sizeof(sockaddr_in)-16);
-	acceptBufSize=0;
-	StartThreadpoolIo(pListen);
-	success=AcceptEx(sListen, ola->s, ola->acceptBuf, acceptBufSize, sizeof(sockaddr_in)+16, sizeof(sockaddr_in)+16, 0, &ola->overlapped);
-	if(!success && WSAGetLastError()!=ERROR_IO_PENDING){
-		DebugBreak();
-	}
-}
-#endif
-
-BOOL SetPrivilege(
-    HANDLE hToken,          // access token handle
-    LPCTSTR lpszPrivilege,  // name of privilege to enable/disable
-    BOOL bEnablePrivilege   // to enable or disable privilege
-    ) 
-{
-    TOKEN_PRIVILEGES tp;
-    LUID luid;
-
-    if ( !LookupPrivilegeValue( 
-            NULL,            // lookup privilege on local system
-            lpszPrivilege,   // privilege to lookup 
-            &luid ) )        // receives LUID of privilege
-    {
-        printf("LookupPrivilegeValue error: %u\n", GetLastError() ); 
-        return FALSE; 
-    }
-
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    if (bEnablePrivilege)
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    else
-        tp.Privileges[0].Attributes = 0;
-
-    // Enable the privilege or disable all privileges.
-
-    if ( !AdjustTokenPrivileges(
-           hToken, 
-           FALSE, 
-           &tp, 
-           sizeof(TOKEN_PRIVILEGES), 
-           (PTOKEN_PRIVILEGES) NULL, 
-           (PDWORD) NULL) )
-    { 
-          printf("AdjustTokenPrivileges error: %u\n", GetLastError() ); 
-          return FALSE; 
-    } 
-
-    if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
-
-    {
-          printf("The token does not have the specified privilege. \n");
-          return FALSE;
-    } 
-
-    return TRUE;
-}
-
-int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE, LPTSTR    lpCmdLine, int       nCmdShow) {
 #if 0
-	{
-		HANDLE hToken;
-		if(!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)){
-			DebugBreak();
-			return FALSE;
+#include <km\Ntifs.h>
+#include <km\Fltkernel.h>
+#else
+
+namespace WinInternal {
+
+typedef struct _FILE_BASIC_INFORMATION {
+  LARGE_INTEGER CreationTime;
+  LARGE_INTEGER LastAccessTime;
+  LARGE_INTEGER LastWriteTime;
+  LARGE_INTEGER ChangeTime;
+  DWORD FileAttributes;
+} FILE_BASIC_INFORMATION, *PFILE_BASIC_INFORMATION;
+
+typedef struct _FILE_STANDARD_INFORMATION {
+  LARGE_INTEGER AllocationSize;
+  LARGE_INTEGER EndOfFile;
+  ULONG         NumberOfLinks;
+  BOOLEAN       DeletePending;
+  BOOLEAN       Directory;
+} FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
+
+typedef struct _FILE_INTERNAL_INFORMATION {
+  LARGE_INTEGER IndexNumber;
+} FILE_INTERNAL_INFORMATION, *PFILE_INTERNAL_INFORMATION;
+
+typedef struct _FILE_EA_INFORMATION {
+  ULONG EaSize;
+} FILE_EA_INFORMATION, *PFILE_EA_INFORMATION;
+
+typedef struct _FILE_ACCESS_INFORMATION {
+  ACCESS_MASK AccessFlags;
+} FILE_ACCESS_INFORMATION, *PFILE_ACCESS_INFORMATION;
+
+typedef struct _FILE_POSITION_INFORMATION {
+  LARGE_INTEGER CurrentByteOffset;
+} FILE_POSITION_INFORMATION, *PFILE_POSITION_INFORMATION;
+
+typedef struct _FILE_MODE_INFORMATION {
+  ULONG Mode;
+} FILE_MODE_INFORMATION, *PFILE_MODE_INFORMATION;
+
+typedef struct _FILE_ALIGNMENT_INFORMATION {
+  ULONG AlignmentRequirement;
+} FILE_ALIGNMENT_INFORMATION, *PFILE_ALIGNMENT_INFORMATION;
+
+typedef struct _FILE_NAME_INFORMATION {
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+} FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
+typedef struct _FILE_ALL_INFORMATION {
+  FILE_BASIC_INFORMATION     BasicInformation;
+  FILE_STANDARD_INFORMATION  StandardInformation;
+  FILE_INTERNAL_INFORMATION  InternalInformation;
+  FILE_EA_INFORMATION        EaInformation;
+  FILE_ACCESS_INFORMATION    AccessInformation;
+  FILE_POSITION_INFORMATION  PositionInformation;
+  FILE_MODE_INFORMATION      ModeInformation;
+  FILE_ALIGNMENT_INFORMATION AlignmentInformation;
+  FILE_NAME_INFORMATION      NameInformation;
+} FILE_ALL_INFORMATION, *PFILE_ALL_INFORMATION;
+
+typedef struct _FILE_FS_VOLUME_INFORMATION {
+  LARGE_INTEGER VolumeCreationTime;
+  ULONG         VolumeSerialNumber;
+  ULONG         VolumeLabelLength;
+  BOOLEAN       SupportsObjects;
+  WCHAR         VolumeLabel[1];
+} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
+
+typedef struct _IO_STATUS_BLOCK {
+  union {
+    NTSTATUS Status;
+    PVOID Pointer;
+  } DUMMYUNIONNAME;
+  ULONG_PTR Information;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+
+typedef enum _FILE_INFORMATION_CLASS {
+  FileDirectoryInformation = 1,
+  FileFullDirectoryInformation,
+  FileBothDirectoryInformation,
+  FileBasicInformation,
+  FileStandardInformation,
+  FileInternalInformation,
+  FileEaInformation,
+  FileAccessInformation,
+  FileNameInformation,
+  FileRenameInformation,
+  FileLinkInformation,
+  FileNamesInformation,
+  FileDispositionInformation,
+  FilePositionInformation,
+  FileFullEaInformation,
+  FileModeInformation,
+  FileAlignmentInformation,
+  FileAllInformation,
+  FileAllocationInformation,
+  FileEndOfFileInformation,
+  FileAlternateNameInformation,
+  FileStreamInformation,
+  FilePipeInformation,
+  FilePipeLocalInformation,
+  FilePipeRemoteInformation,
+  FileMailslotQueryInformation,
+  FileMailslotSetInformation,
+  FileCompressionInformation,
+  FileObjectIdInformation,
+  FileCompletionInformation,
+  FileMoveClusterInformation,
+  FileQuotaInformation,
+  FileReparsePointInformation,
+  FileNetworkOpenInformation,
+  FileAttributeTagInformation,
+  FileTrackingInformation,
+  FileIdBothDirectoryInformation,
+  FileIdFullDirectoryInformation,
+  FileValidDataLengthInformation,
+  FileShortNameInformation,
+  FileIoCompletionNotificationInformation,
+  FileIoStatusBlockRangeInformation,
+  FileIoPriorityHintInformation,
+  FileSfioReserveInformation,
+  FileSfioVolumeInformation,
+  FileHardLinkInformation,
+  FileProcessIdsUsingFileInformation,
+  FileNormalizedNameInformation,
+  FileNetworkPhysicalNameInformation,
+  FileIdGlobalTxDirectoryInformation,
+  FileIsRemoteDeviceInformation,
+  FileAttributeCacheInformation,
+  FileNumaNodeInformation,
+  FileStandardLinkInformation,
+  FileRemoteProtocolInformation,
+  FileMaximumInformation
+} FILE_INFORMATION_CLASS, *PFILE_INFORMATION_CLASS;
+#endif
+
+typedef enum _FS_INFORMATION_CLASS {
+  FileFsVolumeInformation       = 1,
+  FileFsLabelInformation        = 2,
+  FileFsSizeInformation         = 3,
+  FileFsDeviceInformation       = 4,
+  FileFsAttributeInformation    = 5,
+  FileFsControlInformation      = 6,
+  FileFsFullSizeInformation     = 7,
+  FileFsObjectIdInformation     = 8,
+  FileFsDriverPathInformation   = 9,
+  FileFsVolumeFlagsInformation  = 10,
+  FileFsSectorSizeInformation   = 11
+} FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
+
+typedef NTSTATUS (NTAPI *sNtQueryInformationFile)
+                 (HANDLE FileHandle,
+                  PIO_STATUS_BLOCK IoStatusBlock,
+                  PVOID FileInformation,
+                  ULONG Length,
+                  FILE_INFORMATION_CLASS FileInformationClass);
+
+typedef NTSTATUS (NTAPI *sNtQueryVolumeInformationFile)
+                 (HANDLE FileHandle,
+                  PIO_STATUS_BLOCK IoStatusBlock,
+                  PVOID FsInformation,
+                  ULONG Length,
+                  FS_INFORMATION_CLASS FsInformationClass);
+
+//sRtlNtStatusToDosError pRtlNtStatusToDosError;
+//sNtDeviceIoControlFile pNtDeviceIoControlFile;
+sNtQueryInformationFile pNtQueryInformationFile;
+//sNtSetInformationFile pNtSetInformationFile;
+sNtQueryVolumeInformationFile pNtQueryVolumeInformationFile;
+//sNtQueryDirectoryFile pNtQueryDirectoryFile;
+//sNtQuerySystemInformation pNtQuerySystemInformation;
+//#include <Winternl.h>
+typedef BOOLEAN (WINAPI *sRtlTimeToSecondsSince1970) (_In_  PLARGE_INTEGER Time, _Out_ PULONG         ElapsedSeconds);
+
+sRtlTimeToSecondsSince1970 pRtlTimeToSecondsSince1970;
+};
+
+__forceinline int fs__stat_handle(HANDLE handle) {
+  WinInternal::FILE_ALL_INFORMATION file_info;
+  WinInternal::FILE_FS_VOLUME_INFORMATION volume_info;
+  NTSTATUS nt_status;
+  WinInternal::IO_STATUS_BLOCK io_status;
+
+  nt_status = WinInternal::pNtQueryInformationFile(handle,
+                                      &io_status,
+                                      &file_info,
+                                      sizeof file_info,
+                                      WinInternal::FileAllInformation);
+
+  /* Buffer overflow (a warning status code) is expected here. */
+	/*
+  if (NT_ERROR(nt_status)) {
+    SetLastError(pRtlNtStatusToDosError(nt_status));
+    return -1;
+  }
+	*/
+
+  nt_status = WinInternal::pNtQueryVolumeInformationFile(handle,
+                                            &io_status,
+                                            &volume_info,
+                                            sizeof volume_info,
+                                            WinInternal::FileFsVolumeInformation);
+
+  /* Buffer overflow (a warning status code) is expected here. */
+	/*
+  if (io_status.Status == STATUS_NOT_IMPLEMENTED) {
+    statbuf->st_dev = 0;
+  } else if (NT_ERROR(nt_status)) {
+    SetLastError(pRtlNtStatusToDosError(nt_status));
+    return -1;
+  } else {
+    statbuf->st_dev = volume_info.VolumeSerialNumber;
+  }
+	*/
+
+  /* Todo: st_mode should probably always be 0666 for everyone. We might also
+   * want to report 0777 if the file is a .exe or a directory.
+   *
+   * Currently it's based on whether the 'readonly' attribute is set, which
+   * makes little sense because the semantics are so different: the 'read-only'
+   * flag is just a way for a user to protect against accidental deletion, and
+   * serves no security purpose. Windows uses ACLs for that.
+   *
+   * Also people now use uv_fs_chmod() to take away the writable bit for good
+   * reasons. Windows however just makes the file read-only, which makes it
+   * impossible to delete the file afterwards, since read-only files can't be
+   * deleted.
+   *
+   * IOW it's all just a clusterfuck and we should think of something that
+   * makes slightly more sense.
+   *
+   * And uv_fs_chmod should probably just fail on windows or be a total no-op.
+   * There's nothing sensible it can do anyway.
+   */
+
+  if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    //statbuf->st_mode |= S_IFLNK;
+    //if (fs__readlink_handle(handle, NULL, &statbuf->st_size) != 0)
+      return -1;
+
+  } else if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    //statbuf->st_mode |= _S_IFDIR;
+    //statbuf->st_size = 0;
+
+  } else {
+    //statbuf->st_mode |= _S_IFREG;
+    //statbuf->st_size = file_info.StandardInformation.EndOfFile.QuadPart;
+  }
+
+  //if (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_READONLY)
+    //statbuf->st_mode |= _S_IREAD | (_S_IREAD >> 3) | (_S_IREAD >> 6);
+  //else
+    //statbuf->st_mode |= (_S_IREAD | _S_IWRITE) | ((_S_IREAD | _S_IWRITE) >> 3) |
+    //                    ((_S_IREAD | _S_IWRITE) >> 6);
+
+  //FILETIME_TO_TIMESPEC(statbuf->st_atim, file_info.BasicInformation.LastAccessTime);
+  //FILETIME_TO_TIMESPEC(statbuf->st_ctim, file_info.BasicInformation.ChangeTime);
+  //FILETIME_TO_TIMESPEC(statbuf->st_mtim, file_info.BasicInformation.LastWriteTime);
+  //FILETIME_TO_TIMESPEC(statbuf->st_birthtim, file_info.BasicInformation.CreationTime);
+
+  //statbuf->st_ino = file_info.InternalInformation.IndexNumber.QuadPart;
+
+  /* st_blocks contains the on-disk allocation size in 512-byte units. */
+  //statbuf->st_blocks =
+  //    file_info.StandardInformation.AllocationSize.QuadPart >> 9ULL;
+
+  //statbuf->st_nlink = file_info.StandardInformation.NumberOfLinks;
+
+  /* The st_blksize is supposed to be the 'optimal' number of bytes for reading
+   * and writing to the disk. That is, for any definition of 'optimal' - it's
+   * supposed to at least avoid read-update-write behavior when writing to the
+   * disk.
+   *
+   * However nobody knows this and even fewer people actually use this value,
+   * and in order to fill it out we'd have to make another syscall to query the
+   * volume for FILE_FS_SECTOR_SIZE_INFORMATION.
+   *
+   * Therefore we'll just report a sensible value that's quite commonly okay
+   * on modern hardware.
+   */
+  //statbuf->st_blksize = 2048;
+
+  /* Todo: set st_flags to something meaningful. Also provide a wrapper for
+   * chattr(2).
+   */
+  //statbuf->st_flags = 0;
+
+  /* Windows has nothing sensible to say about these values, so they'll just
+   * remain empty.
+   */
+  //statbuf->st_gid = 0;
+  //statbuf->st_uid = 0;
+  //statbuf->st_rdev = 0;
+  //statbuf->st_gen = 0;
+
+  return 0;
+}
+
+__forceinline void fs_stat() {
+  HANDLE handle = CreateFileW(
+		L".",
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS,
+		nullptr);
+
+	if(INVALID_HANDLE_VALUE == handle) {
+		DebugBreak();
+	}
+	fs__stat_handle(handle);
+	CloseHandle(handle);
+}
+
+__declspec(align(64)) __int64 volatile dequeuedRequestCount{0};
+__declspec(align(64)) unsigned __int64 volatile firstRequestStarted{0};
+__declspec(align(64)) unsigned __int64 volatile lastRequestFinished{0};
+__declspec(align(64)) unsigned __int64 volatile WaitVariable{0};
+__declspec(align(64)) unsigned __int64 CompareVariable{0};
+__declspec(align(64)) unsigned __int64 UndesiredValue{0};
+
+__declspec(noinline) bool benchmark_sync_fs_stat() {
+	for(int r = 0; r < numBenchmarkRepetitions; r++) {
+		auto start = __rdtsc();
+		for(int i = 0; i < numRequests; i++) {
+			fs_stat();
 		}
-		SetPrivilege(hToken, TEXT("SeLockMemoryPrivilege"), TRUE);
-		CloseHandle(hToken);
+		auto finish = __rdtsc();
+		wprintf(L"start to finish:                             %f seconds\n", static_cast<double_t>(finish - start) / 3300000000.0);
 	}
-	SIZE_T largePageSize=GetLargePageMinimum();
-	PVOID largePage=VirtualAlloc(NULL, largePageSize, MEM_RESERVE|MEM_COMMIT|MEM_LARGE_PAGES, PAGE_READWRITE);
+	return false;
+}
 
-	if(!largePage){
-		DebugBreak();
+__declspec(noinline) int64_t getTsc1970epoch() {
+//auto ftSpacing = KeQueryTimeIncrement();
+	FILETIME ftNowPrecise{0,0};
+	GetSystemTimePreciseAsFileTime(&ftNowPrecise);
+	std::array<int64_t, 10000> ftList;
+	std::array<int64_t, 10000> tscList;
+	std::array<int64_t, 10000> ftSpacing;
+	std::array<int64_t, 10000> tscSpacing;
+	double_t averageFtSpacing{0};
+	double_t averageTscSpacing{0};
+	int64_t lastTick{*reinterpret_cast<volatile int64_t *>(0x7FFE0014ui32)};
+	for(int i = 0; i < 10000; i++) {
+		int64_t curTick;
+		do { curTick = *reinterpret_cast<volatile int64_t *>(0x7FFE0014ui32); } while(curTick == lastTick);
+		ftList[i] = curTick;
+		tscList[i] = __rdtsc();
+		lastTick = curTick;
 	}
-#endif
-	int sockErr;
+	for(int i = 1; i < 10000; i++) {
+		ftSpacing[i] = ftList[i] - ftList[i - 1];
+		averageFtSpacing += ftSpacing[i];
+		tscSpacing[i] = tscList[i] - tscList[i - 1];
+		averageTscSpacing += tscSpacing[i];
+	}
+	averageFtSpacing /= 9999.0;
+	averageTscSpacing /= 9999.0;
+	return 0;
+}
 
-#ifdef USE_USER_MODE_SCHEDULING
-	BOOL success;
-	dwTlsID=TlsAlloc();
-	completionPort=makeCompletionPort();
+//int64_t Tsc1970epoch{getTsc1970epoch()};
+
+__forceinline int64_t fileTimeFromUTC() {
+#if 1
+	FILETIME sSystemTimeAsFileTime{0,0};
+//GetSystemTimeAsFileTime(&sSystemTimeAsFileTime);
+	uint64_t start = __rdtsc();
+	uint64_t middle = __rdtsc();
+//GetSystemTimePreciseAsFileTime(&sSystemTimeAsFileTime);
+	uint64_t finish = __rdtsc();
+	printf("start to finish = %I64u\n", finish - start);
+	LARGE_INTEGER liSysFileTime{sSystemTimeAsFileTime.dwLowDateTime, sSystemTimeAsFileTime.dwHighDateTime};
+	return liSysFileTime.QuadPart;
+#else
+	return *reinterpret_cast<volatile int64_t *>(0x7FFE0014ui32);
 #endif
-	WSADATA lpWSAData={0};
-	sockErr=WSAStartup(0x202, &lpWSAData);
-	sListen=WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if(INVALID_SOCKET==sListen){
-		DebugBreak();
-	}
-	GUID GuidDisconnectEx = WSAID_DISCONNECTEX;
-	DWORD dwBytes;
-	WSAIoctl(sListen, SIO_GET_EXTENSION_FUNCTION_POINTER,
-             &GuidDisconnectEx, sizeof (GuidDisconnectEx), 
-             &DisconnectEx, sizeof (DisconnectEx), 
-             &dwBytes, NULL, NULL);
+}
+
+__forceinline int64_t fileTimeFromSystemTime() {
+	SYSTEMTIME sysTime1970{1970,1,4,1,0,0,0,0};
+	FILETIME fileType1970{0,0};
+	macroDebugLastError(SystemTimeToFileTime(&sysTime1970, &fileType1970));
+	LARGE_INTEGER liFileType1970{fileType1970.dwLowDateTime, fileType1970.dwHighDateTime};
+	return liFileType1970.QuadPart;
+}
+
+const int64_t fileTimeEpoch1970{fileTimeFromSystemTime()};
+
+__forceinline double_t msSince1970perf() {
+	double_t retC = static_cast<double_t>(fileTimeFromUTC() - fileTimeEpoch1970) * 1.0e-4;
+	return retC;
+}
+
+int64_t msSince1970() {
+//FILETIME sSystemTimeAsFileTime{0,0};
+//GetSystemTimeAsFileTime(&sSystemTimeAsFileTime);
+//ULONG ulSecondsA{0};
+//LARGE_INTEGER liSysFileTime{sSystemTimeAsFileTime.dwLowDateTime, sSystemTimeAsFileTime.dwHighDateTime};
 	
-#ifdef USE_USER_MODE_SCHEDULING
-	if(completionPort!=addCompletionHandle(completionPort, (HANDLE)sListen, CKACCEPT)){
-		DebugBreak();
-	};
-#endif
+//macroDebugLastError(pRtlTimeToSecondsSince1970(&liSysFileTime, &ulSecondsA));
+//int64_t retA = static_cast<int64_t>(ulSecondsA) * 1000;
 
-#ifdef USE_NEW_THREAD_POOL
-	InitializeThreadpoolEnvironment(&tEnvrion);
-	pMainPool=CreateThreadpool(NULL);
-	pCleanup=CreateThreadpoolCleanupGroup();
-	SetThreadpoolCallbackCleanupGroup(&tEnvrion, pCleanup, 0);
-	SetThreadpoolCallbackPool(&tEnvrion, pMainPool);
+//SYSTEMTIME sysTime1970{1970,1,4,1,0,0,0,0};
+//FILETIME fileType1970{0,0};
+//macroDebugLastError(SystemTimeToFileTime(&sysTime1970, &fileType1970));
+//LARGE_INTEGER liFileType1970{fileType1970.dwLowDateTime, fileType1970.dwHighDateTime};
 
-	pListen=CreateThreadpoolIo((HANDLE)sListen, acceptingIoThreadProc, 0, &tEnvrion);
-#endif
+//ULONG ulSecondsB{0};
+//macroDebugLastError(pRtlTimeToSecondsSince1970(&liFileType1970, &ulSecondsB));
+//int64_t retB = static_cast<int64_t>(ulSecondsB) * 1000;
 
-	sockaddr_in service={0};
-	service.sin_family=AF_INET;
-	service.sin_port=htons(8080);
+	int64_t retC = (fileTimeFromUTC() - fileTimeEpoch1970) / 10000i64;
+	return retC;
+}
 
-	sockErr=bind(sListen, (SOCKADDR *) &service, sizeof(service));
-	if(SOCKET_ERROR==sockErr){
-		DebugBreak();
-	}
-	sockErr=listen(sListen, SOMAXCONN);
-	if(SOCKET_ERROR==sockErr){
-		DebugBreak();
-	}
-	for(int i=0; i<numSockets; i++){
-#ifdef USE_USER_MODE_SCHEDULING
-		addAcceptSocket(sListen);
-#endif
-#ifdef USE_NEW_THREAD_POOL
-		addAcceptSocket(sListen);
-#endif
-	}
-#ifdef USE_USER_MODE_SCHEDULING
-	for(int n=0; n<numSchedulers; n++){
-		success=CreateUmsCompletionList(&completionList[n]);
-		if(!success){
-			DebugBreak();
-		}else{SetLastError(0);}
-
-		success=GetUmsCompletionListEvent(completionList[n], &listEvents[n]);
-		SchedulerStartupInfo[n].CompletionList=completionList[n];
-		SchedulerStartupInfo[n].UmsVersion=UMS_VERSION;
-		SchedulerStartupInfo[n].SchedulerParam=(LPVOID)n;
-		SchedulerStartupInfo[n].SchedulerProc=UmsSchedulerProc;
-
-		if(!success){
-			DebugBreak();
-		}else{SetLastError(0);}
-
-		for(int i=0; i<numThreadsPerScheduler; i++){
-			addThread(n, &UmsWorkerThreadProc, (LPVOID)i);
-			numThreadsAlive[n]++;
+#if 0
+__declspec(noinline) void smallestTSC_old1() {
+	SetThreadAffinityMask(GetCurrentThread(), 1);
+	uint64_t smallest = 0xFFFFFFFFFFFFFFFFui64;
+	for(;;) {
+		auto start = __rdtsc();
+		auto finish = __rdtsc();
+		auto diff = finish - start;
+		if(diff < smallest) {
+			smallest = diff;
+			printf("smallest %I64u\n", smallest);
+			if(smallest < 10) { break; }
 		}
 	}
-	HANDLE SchedulerHandlers[numSchedulers]={0};
-	for(int n=0; n<numSchedulers; n++){
-		SchedulerHandlers[n]=CreateThread(0, 0, SchedulerProc, (LPVOID)n, 0, 0);
+}
+__declspec(noinline) void smallestTSC_old2() {
+	SetThreadAffinityMask(GetCurrentThread(), 1);
+	int32_t smallest = 0x7FFFFFFFi32;
+	for(;;) {
+		int32_t start = __rdtsc();
+		int32_t finish = __rdtsc();
+		int32_t diff = finish - start;
+		if(diff < smallest) {
+			smallest = diff;
+			printf("smallest %d\n", smallest);
+			if(smallest < 10) { break; }
+		}
+	}
+}
+__declspec(noinline) void smallestTSC() {
+//SetThreadAffinityMask(GetCurrentThread(), 1);
+	uint64_t smallest = 0xFFFFFFFFFFFFFFFFui64;
+	for(;;) {
+		SwitchToThread();
+		uint64_t start = __rdtsc();
+		uint64_t finish = __rdtsc();
+		uint64_t diff = finish - start;
+		if(diff < smallest) {
+			smallest = diff;
+			printf("smallest %I64u\n", smallest);
+			if(smallest < 10) { break; }
+		}
+	}
+}
+#endif
+
+int __cdecl _tmain(int argc, _TCHAR* argv[]) {
+//smallestTSC();
+  HMODULE ntdll_module;
+// HMODULE kernel32_module;
+
+  ntdll_module = GetModuleHandleA("ntdll.dll");
+
+	WinInternal::pNtQueryInformationFile = (WinInternal::sNtQueryInformationFile) GetProcAddress(ntdll_module, "NtQueryInformationFile");
+  WinInternal::pNtQueryVolumeInformationFile = (WinInternal::sNtQueryVolumeInformationFile) GetProcAddress(ntdll_module, "NtQueryVolumeInformationFile");
+	WinInternal::pRtlTimeToSecondsSince1970 = (WinInternal::sRtlTimeToSecondsSince1970) GetProcAddress(ntdll_module, "RtlTimeToSecondsSince1970");
+
+	if(0) {
+		std::array<double_t, 1000> counts;
+		for(int i = 0; i < 1000; i++) {
+			counts[i] = msSince1970perf();
+		}
+		for(int i = 0; i < 1000; i++) {
+			printf("msSince1970perf():  %f\n", counts[i]);
+		}
 	}
 
-	WaitForMultipleObjects(numSchedulers, SchedulerHandlers, TRUE, INFINITE);
-	for(int n=0; n<numSchedulers; n++){
-		CloseHandle(SchedulerHandlers[n]);
-	}
+#ifdef USE_SYNCHRONOUS
+	wprintf(TEXT("benchmark_sync_fs_stat started\n"));
+	benchmark_sync_fs_stat();
+	wprintf(TEXT("benchmark_sync_fs_stat finished\n"));
 #endif
+
 #ifdef USE_NEW_THREAD_POOL
-	OutputDebugString(TEXT("CloseThreadpoolCleanupGroupMembers waiting\n"));
-	SleepEx(INFINITE, TRUE);
-	CloseThreadpoolCleanupGroupMembers(pCleanup, FALSE, NULL);
-	OutputDebugString(TEXT("CloseThreadpoolCleanupGroupMembers done\n"));
+#ifdef USE_TEST_WEBSERVER
+	wprintf(TEXT("test_new_thread_pool started\n"));
+	test_new_thread_pool();
+	wprintf(TEXT("test_new_thread_pool finished\n"));
 #endif
-	
+	wprintf(TEXT("benchmark_ntp_workQueue_fs_stat started\n"));
+	benchmark_ntp_workQueue_fs_stat();
+	wprintf(TEXT("benchmark_ntp_workQueue_fs_stat finished\n"));
+
+	wprintf(TEXT("benchmark_ntp_trySubmit_fs_stat started\n"));
+	benchmark_ntp_trySubmit_fs_stat();
+	wprintf(TEXT("benchmark_ntp_trySubmit_fs_stat finished\n"));
+
+#endif
+
+#ifdef USE_DIRECT_THREAD_POOL
+#ifdef USE_TEST_WEBSERVER
+	wprintf(TEXT("test_direct_thread_pool started\n"));
+	test_direct_thread_pool();
+	wprintf(TEXT("test_direct_thread_pool finished\n"));
+#endif
+	wprintf(TEXT("benchmark_dtp_fs_stat started\n"));
+	benchmark_dtp_fs_stat();
+	wprintf(TEXT("benchmark_dtp_fs_stat finished\n"));
+#endif
+
+#ifdef USE_USER_MODE_SCHEDULING
+#ifdef USE_TEST_WEBSERVER
+	wprintf(TEXT("test_user_mode_scheduling started\n"));
+	test_user_mode_scheduling();
+	wprintf(TEXT("test_user_mode_scheduling finished\n"));
+#endif
+	wprintf(TEXT("benchmark_ums_fs_stat started\n"));
+	benchmark_ums_fs_stat();
+	wprintf(TEXT("benchmark_ums_fs_stat finished\n"));
+#endif
+
+#ifdef USE_OLD_THREAD_POOL
+#ifdef USE_TEST_WEBSERVER
+	wprintf(TEXT("test_old_thread_pool started\n"));
+	test_old_thread_pool();
+	wprintf(TEXT("test_old_thread_pool finished\n"));
+#endif
+	wprintf(TEXT("benchmark_otp_fs_stat started\n"));
+	benchmark_otp_fs_stat();
+	wprintf(TEXT("benchmark_opt_fs_stat finished\n"));
+#endif
+
+#ifdef _DEBUG
+	wprintf(L"Press any key to quit...");
+	getchar();
+#endif
 	return 0;
 }
